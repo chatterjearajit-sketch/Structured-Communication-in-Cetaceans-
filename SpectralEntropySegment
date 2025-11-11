@@ -1,0 +1,97 @@
+# Install required packages
+!pip install noisereduce soundfile scipy librosa matplotlib --quiet
+
+import numpy as np
+import soundfile as sf
+import noisereduce as nr
+from scipy.signal import iirnotch, filtfilt, stft
+from scipy.ndimage import label
+import matplotlib.pyplot as plt
+
+# --- PARAMETERS ---
+notch_freqs = [15000, 20000, 30000]  # Adjust as needed
+recording_files = [f"/content/recording{i}.wav" for i in range(1, 9)]  # Assumes files are uploaded
+
+# --- FUNCTIONS ---
+def apply_notch_filter(data, freq, fs, Q=30):
+    b, a = iirnotch(freq, Q, fs)
+    return filtfilt(b, a, data)
+
+def spectral_entropy(Sxx, eps=1e-10):
+    Sxx_norm = Sxx / (np.sum(Sxx, axis=0, keepdims=True) + eps)
+    entropy = -np.sum(Sxx_norm * np.log2(Sxx_norm + eps), axis=0)
+    return entropy
+
+def segment_by_energy(audio, sr, frame_size=0.02, hop_size=0.01, threshold_ratio=0.1, min_segment_ms=50):
+    frame_len = int(frame_size * sr)
+    hop_len = int(hop_size * sr)
+    energy = np.array([np.sum(audio[i:i+frame_len]**2)
+                       for i in range(0, len(audio)-frame_len, hop_len)])
+    threshold = threshold_ratio * np.max(energy)
+    active = energy > threshold
+    labels, num = label(active)
+    segments = []
+    for seg in range(1, num+1):
+        idx = np.where(labels == seg)[0]
+        start = idx[0] * hop_len
+        end = idx[-1] * hop_len + frame_len
+        if (end - start) > (min_segment_ms/1000) * sr:
+            segments.append((start, end))
+    return segments
+
+# --- MAIN PROCESSING LOOP ---
+results = []
+
+for fname in recording_files:
+    # 1. Load audio
+    audio, sr = sf.read(fname)
+    if audio.ndim > 1:
+        audio = np.mean(audio, axis=1)  # Convert to mono
+
+    # 2. Notch filter
+    filtered_audio = audio.copy()
+    for freq in notch_freqs:
+        if 0 < freq < sr / 2:
+            filtered_audio = apply_notch_filter(filtered_audio, freq, sr)
+
+    # 3. Spectral gating noise reduction
+    noise_clip = filtered_audio[:int(0.4 * sr)]
+    reduced_audio = nr.reduce_noise(
+        y=filtered_audio,
+        sr=sr,
+        y_noise=noise_clip,
+        stationary=False,
+        prop_decrease=1.0
+    )
+
+    # 4. Segment by energy
+    segments = segment_by_energy(reduced_audio, sr)
+
+    # 5. Calculate spectral entropy for each segment
+    entropies = []
+    for start, end in segments:
+        seg_audio = reduced_audio[start:end]
+        if len(seg_audio) < 1024:
+            continue  # skip too-short segments
+        f, t, Zxx = stft(seg_audio, fs=sr, nperseg=1024, noverlap=512)
+        Sxx = np.abs(Zxx)
+        frame_entropies = spectral_entropy(Sxx)
+        entropies.append(np.mean(frame_entropies))
+
+    # 6. Compute sample mean and std of entropies for this recording
+    mean_entropy = np.mean(entropies) if entropies else np.nan
+    std_entropy = np.std(entropies, ddof=1) if len(entropies) > 1 else np.nan
+    results.append({
+        "file": fname,
+        "mean_entropy": mean_entropy,
+        "std_entropy": std_entropy,
+        "num_segments": len(entropies)
+    })
+
+    print(f"{fname}: mean entropy = {mean_entropy:.4f}, std = {std_entropy:.4f}, n_segments = {len(entropies)}")
+
+# --- SUMMARY TABLE ---
+import pandas as pd
+df = pd.DataFrame(results)
+print("\nSummary Table:")
+print(df)
