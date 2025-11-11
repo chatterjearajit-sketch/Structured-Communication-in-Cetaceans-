@@ -1,0 +1,68 @@
+import numpy as np
+import soundfile as sf
+from collections import Counter
+
+# STEP 1: Quantize the .wav file into symbols
+def quantize_wav(wavfile, n_symbols=8):
+    data, sr = sf.read(wavfile)
+    if data.ndim > 1:
+        data = data.mean(axis=1)  # mono
+    data = (data - data.min()) / (data.max() - data.min())  # scale to [0,1]
+    quantized = np.floor(data * n_symbols).astype(int)
+    quantized[quantized == n_symbols] = n_symbols - 1
+    return quantized
+
+# STEP 2: Estimate PHM model parameters from observed data
+def estimate_phm_params(seq, n_symbols):
+    # We'll estimate k_i for each symbol s as: k_i = log(2) / median_gap_i,
+    # so that the median waiting time to occurrence is half-maximal.
+    last_occurrence = np.zeros(n_symbols, dtype=int) - 1
+    gaps = [[] for _ in range(n_symbols)]
+    for idx, symbol in enumerate(seq):
+        if last_occurrence[symbol] != -1:
+            gaps[symbol].append(idx - last_occurrence[symbol])
+        last_occurrence[symbol] = idx
+    # Use median gap as time constant for each symbol
+    median_gaps = np.array([np.median(gap) if gap else 1.0 for gap in gaps])
+    k = np.log(2) / median_gaps
+    k[np.isnan(k)] = 1.0  # fallback
+    return k
+
+# STEP 3: Generate a sequence from the PHM model
+def generate_phm_sequence(k, n_symbols, length, seed=42):
+    np.random.seed(seed)
+    tau = np.ones(n_symbols, dtype=int)  # time since last emission
+    seq = []
+    for i in range(length):
+        # Calculate motivation (action-specific energy) for each symbol
+        A = 1 - np.exp(-k * tau)
+        probs = A / A.sum()
+        symbol = np.random.choice(n_symbols, p=probs)
+        seq.append(symbol)
+        tau += 1
+        tau[symbol] = 1  # reset time since last occurrence for emitted symbol
+    return np.array(seq)
+
+# STEP 4: Compute Shannon entropy
+def shannon_entropy(seq):
+    cnt = Counter(seq)
+    probs = np.array(list(cnt.values())) / len(seq)
+    return -np.sum(probs * np.log2(probs))
+
+# ---- USAGE EXAMPLE ----
+wav_file = "/content/audiomass-output (1).wav"
+n_symbols = 8
+quantized = quantize_wav(wav_file, n_symbols=n_symbols)
+
+# Estimate PHM parameters from sequence
+k = estimate_phm_params(quantized, n_symbols)
+
+# Generate a PHM model sequence of comparable length
+simulated = generate_phm_sequence(k, n_symbols, length=len(quantized))
+
+# Calculate entropy for both sequences
+original_entropy = shannon_entropy(quantized)
+phm_entropy = shannon_entropy(simulated)
+
+print(f"Shannon entropy of original sequence: {original_entropy:.4f} bits/symbol")
+print(f"Shannon entropy of simulated PHM sequence: {phm_entropy:.4f} bits/symbol")
