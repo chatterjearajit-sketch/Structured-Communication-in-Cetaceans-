@@ -1,0 +1,278 @@
+!pip install torch librosa numpy scipy matplotlib
+import numpy as np
+import librosa
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from scipy.io import wavfile
+import matplotlib.pyplot as plt
+
+class TransformerAudioEncoder(nn.Module):
+    """
+    Simplified Transformer encoder for audio entropy calculation
+    """
+    def __init__(self, d_model=128, n_heads=8, n_layers=2, vocab_size=256):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.vocab_size = vocab_size
+        
+        # Input embedding layer
+        self.input_projection = nn.Linear(1, d_model)  # For audio samples
+        self.positional_encoding = self._create_positional_encoding(5000, d_model)
+        
+        # Multi-head attention layers
+        self.attention_layers = nn.ModuleList([
+            nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+            for _ in range(n_layers)
+        ])
+        
+        # Layer normalization
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(d_model) for _ in range(n_layers)
+        ])
+        
+        # Output projection to vocabulary
+        self.output_projection = nn.Linear(d_model, vocab_size)
+        
+    def _create_positional_encoding(self, max_len, d_model):
+        """Create positional encoding matrix"""
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() *
+                           -(np.log(10000.0) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        return pe.unsqueeze(0)
+    
+    def forward(self, x):
+        """
+        Forward pass through transformer
+        x: (batch_size, seq_len, 1) - audio samples
+        """
+        batch_size, seq_len, _ = x.shape
+        
+        # Input projection and positional encoding
+        x = self.input_projection(x)  # (batch_size, seq_len, d_model)
+        x = x + self.positional_encoding[:, :seq_len, :].to(x.device)
+        
+        # Apply attention layers
+        for attention, layer_norm in zip(self.attention_layers, self.layer_norms):
+            # Self-attention
+            attn_output, _ = attention(x, x, x)
+            x = layer_norm(x + attn_output)
+        
+        # Output projection to vocabulary
+        logits = self.output_projection(x)  # (batch_size, seq_len, vocab_size)
+        
+        return logits
+
+def load_and_preprocess_audio(file_path, target_sr=16000, max_duration=60):
+    """
+    Load and preprocess audio file
+    """
+    try:
+        # Load audio file
+        audio, sr = librosa.load(file_path, sr=target_sr, duration=max_duration)
+        
+        # Normalize audio to [-1, 1]
+        audio = audio / np.max(np.abs(audio)) if np.max(np.abs(audio)) > 0 else audio
+        
+        print(f"Loaded audio: {len(audio)} samples, {len(audio)/sr:.2f} seconds at {sr} Hz")
+        
+        return audio, sr
+    
+    except Exception as e:
+        print(f"Error loading audio: {e}")
+        return None, None
+
+def calculate_shannon_entropy(probabilities):
+    """
+    Calculate Shannon entropy: H(y) = -∑(y_k * log(y_k))
+    """
+    # Add small epsilon to avoid log(0)
+    epsilon = 1e-12
+    probabilities = probabilities + epsilon
+    
+    # Calculate entropy (using natural log)
+    entropy = -torch.sum(probabilities * torch.log(probabilities), dim=-1)
+    
+    return entropy
+
+def segment_audio(audio, segment_length=1024, overlap=512):
+    """
+    Segment audio into overlapping windows
+    """
+    segments = []
+    step = segment_length - overlap
+    
+    for i in range(0, len(audio) - segment_length + 1, step):
+        segment = audio[i:i + segment_length]
+        segments.append(segment)
+    
+    return np.array(segments)
+
+def calculate_audio_entropy(file_path, segment_length=1024, overlap=512):
+    """
+    Main function to calculate entropy of audio using transformer method
+    """
+    # Load audio
+    audio, sr = load_and_preprocess_audio(file_path)
+    if audio is None:
+        return None
+    
+    # Segment audio
+    segments = segment_audio(audio, segment_length, overlap)
+    print(f"Created {len(segments)} audio segments")
+    
+    # Initialize transformer model
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = TransformerAudioEncoder(d_model=128, n_heads=8, n_layers=2, vocab_size=256)
+    model.to(device)
+    model.eval()
+    
+    # Convert segments to torch tensor
+    # Reshape to (batch_size, seq_len, 1) for transformer input
+    audio_tensor = torch.FloatTensor(segments).unsqueeze(-1).to(device)
+    
+    entropies = []
+    
+    with torch.no_grad():
+        # Process in batches to avoid memory issues
+        batch_size = 32
+        for i in range(0, len(segments), batch_size):
+            batch = audio_tensor[i:i + batch_size]
+            
+            # Forward pass through transformer
+            logits = model(batch)  # (batch_size, seq_len, vocab_size)
+            
+            # Convert logits to probabilities using softmax
+            probabilities = F.softmax(logits, dim=-1)
+            
+            # Calculate Shannon entropy for each position
+            batch_entropies = calculate_shannon_entropy(probabilities)
+            
+            # Average entropy across sequence length
+            avg_entropies = torch.mean(batch_entropies, dim=1)
+            
+            entropies.extend(avg_entropies.cpu().numpy())
+    
+    entropies = np.array(entropies)
+    
+    # Calculate statistics
+    results = {
+        'mean_entropy': np.mean(entropies),
+        'std_entropy': np.std(entropies),
+        'min_entropy': np.min(entropies),
+        'max_entropy': np.max(entropies),
+        'entropy_over_time': entropies,
+        'num_segments': len(entropies),
+        'segment_length': segment_length,
+        'sample_rate': sr
+    }
+    
+    return results
+
+def plot_entropy_analysis(results, save_path=None):
+    """
+    Plot entropy analysis results
+    """
+    if results is None:
+        print("No results to plot")
+        return
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+    
+    # Plot entropy over time
+    time_axis = np.arange(len(results['entropy_over_time'])) * (results['segment_length'] - 512) / results['sample_rate']
+    
+    ax1.plot(time_axis, results['entropy_over_time'], 'b-', linewidth=1)
+    ax1.set_xlabel('Time (seconds)')
+    ax1.set_ylabel('Shannon Entropy (nats)')
+    ax1.set_title('Audio Entropy Over Time')
+    ax1.grid(True, alpha=0.3)
+    
+    # Add mean line
+    ax1.axhline(y=results['mean_entropy'], color='r', linestyle='--', 
+                label=f'Mean: {results["mean_entropy"]:.3f}')
+    ax1.legend()
+    
+    # Plot entropy histogram
+    ax2.hist(results['entropy_over_time'], bins=50, alpha=0.7, color='skyblue', edgecolor='black')
+    ax2.axvline(x=results['mean_entropy'], color='r', linestyle='--', linewidth=2,
+                label=f'Mean: {results["mean_entropy"]:.3f}')
+    ax2.set_xlabel('Shannon Entropy (nats)')
+    ax2.set_ylabel('Frequency')
+    ax2.set_title('Distribution of Entropy Values')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Plot saved to {save_path}")
+    
+    plt.show()
+
+def print_entropy_summary(results):
+    """
+    Print summary of entropy analysis
+    """
+    if results is None:
+        print("No results to summarize")
+        return
+    
+    print("\n" + "="*50)
+    print("AUDIO ENTROPY ANALYSIS SUMMARY")
+    print("="*50)
+    print(f"Number of segments analyzed: {results['num_segments']}")
+    print(f"Segment length: {results['segment_length']} samples")
+    print(f"Sample rate: {results['sample_rate']} Hz")
+    print(f"Total duration: ~{results['num_segments'] * (results['segment_length'] - 512) / results['sample_rate']:.2f} seconds")
+    print()
+    print("ENTROPY STATISTICS:")
+    print(f"Mean entropy: {results['mean_entropy']:.4f} nats")
+    print(f"Standard deviation: {results['std_entropy']:.4f} nats")
+    print(f"Minimum entropy: {results['min_entropy']:.4f} nats")
+    print(f"Maximum entropy: {results['max_entropy']:.4f} nats")
+    print(f"Entropy range: {results['max_entropy'] - results['min_entropy']:.4f} nats")
+    print()
+    print("INTERPRETATION:")
+    if results['mean_entropy'] < 3.0:
+        print("- Low entropy: Audio has high predictability/structure")
+    elif results['mean_entropy'] < 5.0:
+        print("- Medium entropy: Audio has moderate predictability")
+    else:
+        print("- High entropy: Audio has low predictability/high randomness")
+
+# Example usage
+if __name__ == "__main__":
+   
+    audio_file_path = "/content/audiomass-output (3).wav"
+    
+    print("Starting audio entropy analysis...")
+    print("This may take a few minutes depending on file size and hardware...")
+    
+    # Calculate entropy
+    results = calculate_audio_entropy(
+        audio_file_path, 
+        segment_length=1024,  # Adjust based on your needs
+        overlap=512           # 50% overlap
+    )
+    
+    if results is not None:
+        # Print summary
+        print_entropy_summary(results)
+        
+        # Plot results
+        plot_entropy_analysis(results, save_path="entropy_analysis.png")
+        
+        # Save detailed results
+        np.save("entropy_results.npy", results)
+        print("\nDetailed results saved to 'entropy_results.npy'")
+    else:
+        print("Failed to analyze audio file. Please check the file path and format.")
