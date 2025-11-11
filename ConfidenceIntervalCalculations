@@ -1,0 +1,46 @@
+import numpy as np
+import pandas as pd
+from scipy.stats import t
+
+# Your summary table data
+data = {
+    "file": [
+        "/content/recording1.wav", "/content/recording2.wav", "/content/recording3.wav",
+        "/content/recording4.wav", "/content/recording5.wav", "/content/recording6.wav",
+        "/content/recording7.wav", "/content/recording8.wav"
+    ],
+    "mean_entropy": [4.5433, 4.3627, 3.2215, 3.4321, 3.1710, 3.2802, 3.2697, 3.3557],
+    "std_entropy": [0.1797, 0.5630, 0.5357, 0.4597, 0.1572, 0.1718, 0.1596, 0.2023],
+    "num_segments": [6, 15, 25, 22, 20, 26, 26, 35]
+}
+
+df = pd.DataFrame(data)
+
+# Calculate 95% confidence intervals
+conf_level = 0.95
+alpha = 1 - conf_level
+
+lower_bounds = []
+upper_bounds = []
+
+for i, row in df.iterrows():
+    n = row['num_segments']
+    mean = row['mean_entropy']
+    std = row['std_entropy']
+    if n > 1:
+        t_crit = t.ppf(1 - alpha/2, df=n-1)
+        margin = t_crit * std / np.sqrt(n)
+        lower = mean - margin
+        upper = mean + margin
+    else:
+        lower = np.nan
+        upper = np.nan
+    lower_bounds.append(lower)
+    upper_bounds.append(upper)
+
+df['CI_lower'] = lower_bounds
+df['CI_upper'] = upper_bounds
+
+# Print the table with confidence intervals
+pd.set_option('display.precision', 4)
+print(df[['file', 'mean_entropy', 'std_entropy', 'num_segments', 'CI_lower', 'CI_upper']])
