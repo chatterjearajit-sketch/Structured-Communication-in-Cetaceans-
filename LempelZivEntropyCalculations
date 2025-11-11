@@ -1,0 +1,49 @@
+import numpy as np
+import soundfile as sf
+
+# Load and quantize the audio
+def load_and_quantize(wav_path, n_symbols=8):
+    signal, sr = sf.read(wav_path)
+    if signal.ndim > 1:
+        signal = np.mean(signal, axis=1)  # convert to mono
+    # Normalize to [0, 1]
+    signal = (signal - signal.min()) / (signal.max() - signal.min())
+    # Quantize amplitudes into n_symbols bins [0, n_symbols-1]
+    quantized = np.floor(signal * n_symbols).astype(int)
+    quantized[quantized == n_symbols] = n_symbols - 1  # edge case
+    return quantized
+
+# Lempel–Ziv Complexity (exhaustive parsing)
+def lempel_ziv_complexity(seq):
+    n = len(seq)
+    i, c = 0, 1
+    S = set()
+    l = 1
+    while i + l <= n:
+        w = tuple(seq[i:i+l])
+        if w not in S:
+            S.add(w)
+            c += 1
+            i += l
+            l = 1
+        else:
+            l += 1
+            if i + l > n:
+                i += 1
+                l = 1
+    return c
+
+# Normalize to get "entropy rate"-like value
+def lz_entropy(seq):
+    complexity = lempel_ziv_complexity(seq)
+    n = len(seq)
+    entropy_rate = complexity * np.log2(n) / n
+    return entropy_rate, complexity
+
+# ---------- USAGE ----------
+wav_file = "/content/audiomass-output (1).wav" 
+quantized_seq = load_and_quantize(wav_file, n_symbols=8)
+lz_entropy_rate, lz_complexity = lz_entropy(quantized_seq)
+
+print(f"Lempel-Ziv complexity: {lz_complexity}")
+print(f"Lempel-Ziv normalized entropy rate: {lz_entropy_rate:.4f} bits/symbol")
