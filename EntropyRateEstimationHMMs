@@ -1,0 +1,132 @@
+!pip install hmmlearn
+import librosa
+import numpy as np
+from collections import Counter
+import math
+from hmmlearn import hmm
+
+def detect_vocalizations(y, sr, frame_length=2048, hop_length=512,
+                        energy_threshold=0.02, min_silence_duration=0.1):
+    """
+    Detect vocalizations based on short-time energy.
+    Returns list of (start_sec, end_sec) tuples.
+    """
+    energy = np.array([
+        np.sum(np.abs(y[i:i+frame_length])**2)
+        for i in range(0, len(y), hop_length)
+    ])
+
+    if energy.max() > 0:
+        energy /= energy.max()
+    else:
+        energy[:] = 0
+
+    vocal_frames = energy > energy_threshold
+
+    segments = []
+    start = None
+    silence_count = 0
+    min_silence_frames = int(min_silence_duration * sr / hop_length)
+
+    for i, is_vocal in enumerate(vocal_frames):
+        if is_vocal:
+            if start is None:
+                start = i
+            silence_count = 0
+        else:
+            if start is not None:
+                silence_count += 1
+                if silence_count > min_silence_frames:
+                    end = i - silence_count + 1
+                    segments.append((start, end))
+                    start = None
+                    silence_count = 0
+    if start is not None:
+        segments.append((start, len(vocal_frames) - 1))
+
+    segments_sec = [(s * hop_length / sr, e * hop_length / sr) for s, e in segments]
+    return segments_sec
+
+def assign_symbols_to_segments(segments):
+    """
+    Assign unique symbols (characters) to each vocal segment.
+    """
+    base_chars = [chr(i) for i in range(ord('A'), ord('Z') + 1)] + \
+                 [chr(i) for i in range(ord('a'), ord('z') + 1)]
+    symbols = []
+    for i in range(len(segments)):
+        if i < len(base_chars):
+            symbols.append(base_chars[i])
+        else:
+            symbols.append(chr(128 + (i - len(base_chars)) % 128))  # fallback for >52 units
+    return symbols
+
+def encode_sequence(symbols):
+    """
+    Encode sequence of symbols as integer observations for HMM.
+    """
+    unique_symbols = sorted(set(symbols))
+    symbol_to_int = {s: i for i, s in enumerate(unique_symbols)}
+    encoded = np.array([symbol_to_int[s] for s in symbols]).reshape(-1, 1)
+    return encoded, symbol_to_int
+
+def fit_hmm(observations, n_states=4):
+    """
+    Fit a Multinomial HMM to the observation sequence.
+    """
+    model = hmm.MultinomialHMM(n_components=n_states, n_iter=100, tol=0.01, verbose=False)
+    model.fit(observations)
+    return model
+
+def compute_entropy_rate(hmm_model):
+    """
+    Compute approximate HMM entropy rate from stationary dist, transitions, emissions.
+    """
+    A = hmm_model.transmat_
+    B = hmm_model.emissionprob_
+
+    eigvals, eigvecs = np.linalg.eig(A.T)
+    stat_dist = np.real(eigvecs[:, np.isclose(eigvals, 1)])
+    stat_dist = stat_dist[:, 0]
+    stat_dist /= stat_dist.sum()
+
+    H_rate = 0.0
+    for i, pi in enumerate(stat_dist):
+        emission_entropy = -np.sum([p * np.log2(p) for p in B[i] if p > 0])
+        transition_entropy = -np.sum([p * np.log2(p) for p in A[i] if p > 0])
+        H_rate += pi * (emission_entropy + transition_entropy)
+    return H_rate
+
+def main(wav_path, n_states=4):
+    # Load .wav audio
+    y, sr = librosa.load(wav_path, sr=None)
+    print(f"Loaded audio: {wav_path}, duration: {len(y)/sr:.2f} s, sampling rate: {sr}")
+
+    # Detect vocal segments
+    segments = detect_vocalizations(y, sr)
+    print(f"Detected {len(segments)} vocal units.")
+
+    if len(segments) == 0:
+        print("No vocalizations detected, exiting.")
+        return
+
+    # Assign symbols
+    symbols = assign_symbols_to_segments(segments)
+    print(f"Symbolic sequence: {''.join(symbols)}")
+
+    # Encode sequence for HMM
+    observations, symbol_map = encode_sequence(symbols)
+    print(f"Number of unique symbols: {len(symbol_map)}")
+
+    # Fit HMM
+    model = fit_hmm(observations, n_states=n_states)
+    print(f"HMM trained with {n_states} hidden states.")
+
+    # Compute entropy rate
+    entropy_rate = compute_entropy_rate(model)
+    print(f"Approximate HMM entropy rate per symbol: {entropy_rate:.4f} bits")
+
+if __name__ == "__main__":
+    # replace 'your_recording.wav' with your .wav file path
+    wav_file_path = "/content/audiomass-output (3).wav"
+    main(wav_file_path, n_states=4)
