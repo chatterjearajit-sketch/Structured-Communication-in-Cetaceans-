@@ -1,0 +1,496 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+from scipy.stats import norm, gamma
+import librosa
+from sklearn.mixture import GaussianMixture
+from scipy.special import logsumexp
+import warnings
+warnings.filterwarnings('ignore')
+
+class RegimeSwitchingSDE:
+    """
+    Regime-switching SDE for whale vocalization modeling
+
+    States: 0=Quiet, 1=Building, 2=Burst, 3=Decay
+    SDE: dX_t = θ(S_t)(μ(S_t) - X_t)dt + σ(S_t)dW_t
+    """
+
+    def __init__(self, n_states=4):
+        self.n_states = n_states
+        self.state_names = ['Quiet', 'Building', 'Burst', 'Decay']
+
+        # Initialize parameters
+        self.transition_matrix = None
+        self.mu = None  # mean reversion levels
+        self.theta = None  # mean reversion speeds
+        self.sigma = None  # volatilities
+        self.pi0 = None  # initial state probabilities
+
+    def initialize_parameters(self, data):
+        """Initialize parameters based on data characteristics"""
+
+        # Use GMM to identify potential states from amplitude levels
+        gmm = GaussianMixture(n_components=self.n_states, random_state=42)
+        gmm.fit(data.reshape(-1, 1))
+
+        # Sort by mean amplitude (Quiet < Building < Burst < Decay)
+        sorted_idx = np.argsort(gmm.means_.flatten())
+
+        # Initialize state-dependent parameters
+        self.mu = np.array([0.05, 0.15, 0.5, 0.25])  # Expected levels
+        self.theta = np.array([2.0, 1.0, 0.5, 3.0])  # Reversion speeds
+        self.sigma = np.array([0.02, 0.05, 0.1, 0.08])  # Volatilities
+
+        # Initialize transition matrix with biological constraints
+        self.transition_matrix = np.array([
+            [0.95, 0.05, 0.00, 0.00],  # Quiet -> Building
+            [0.10, 0.70, 0.20, 0.00],  # Building -> Quiet/Building/Burst
+            [0.00, 0.00, 0.80, 0.20],  # Burst -> Burst/Decay
+            [0.30, 0.00, 0.00, 0.70]   # Decay -> Quiet/Decay
+        ])
+
+        # Initial state probabilities
+        self.pi0 = np.array([0.7, 0.2, 0.05, 0.05])
+
+    def simulate(self, T, dt=0.01):
+        """Simulate regime-switching SDE"""
+        n_steps = int(T / dt)
+        X = np.zeros(n_steps)
+        states = np.zeros(n_steps, dtype=int)
+
+        # Initial conditions
+        states[0] = np.random.choice(self.n_states, p=self.pi0)
+        X[0] = np.random.normal(self.mu[states[0]], self.sigma[states[0]]/np.sqrt(2*self.theta[states[0]]))
+
+        # Simulate path
+        for i in range(1, n_steps):
+            # State transition
+            if np.random.random() < dt:  # Poisson transitions
+                states[i] = np.random.choice(self.n_states, p=self.transition_matrix[states[i-1]])
+            else:
+                states[i] = states[i-1]
+
+            # SDE evolution
+            s = states[i]
+            drift = self.theta[s] * (self.mu[s] - X[i-1]) * dt
+            diffusion = self.sigma[s] * np.sqrt(dt) * np.random.normal()
+
+            X[i] = max(0, X[i-1] + drift + diffusion)  # Ensure non-negative
+
+        return X, states
+
+    def viterbi_states(self, data):
+        """Estimate most likely state sequence using Viterbi algorithm"""
+        T = len(data)
+
+        # Initialize forward probabilities
+        log_probs = np.zeros((T, self.n_states))
+        path = np.zeros((T, self.n_states), dtype=int)
+
+        # Initial probabilities
+        for s in range(self.n_states):
+            log_probs[0, s] = (np.log(self.pi0[s]) +
+                              norm.logpdf(data[0], self.mu[s], self.sigma[s]))
+
+        # Forward pass
+        for t in range(1, T):
+            for s in range(self.n_states):
+                # Transition probabilities
+                trans_probs = (log_probs[t-1] +
+                              np.log(self.transition_matrix[:, s]))
+
+                # Best previous state
+                path[t, s] = np.argmax(trans_probs)
+
+                # Emission probability
+                emission = norm.logpdf(data[t], self.mu[s], self.sigma[s])
+                log_probs[t, s] = np.max(trans_probs) + emission
+
+        # Backward pass
+        states = np.zeros(T, dtype=int)
+        states[T-1] = np.argmax(log_probs[T-1])
+
+        for t in range(T-2, -1, -1):
+            states[t] = path[t+1, states[t+1]]
+
+        return states
+
+    def fit(self, data, max_iter=100, tol=1e-6):
+        """Fit regime-switching SDE using EM algorithm"""
+
+        self.initialize_parameters(data)
+        T = len(data)
+
+        log_likelihood_prev = -np.inf
+
+        for iteration in range(max_iter):
+            # E-step: Estimate state probabilities
+            states = self.viterbi_states(data)
+
+            # M-step: Update parameters
+            for s in range(self.n_states):
+                mask = states == s
+                if np.sum(mask) > 1:
+                    # Update mean reversion level
+                    self.mu[s] = np.mean(data[mask])
+
+                    # Update volatility
+                    residuals = data[mask] - self.mu[s]
+                    self.sigma[s] = max(0.01, np.std(residuals))
+
+                    # Update mean reversion speed (approximate)
+                    if len(residuals) > 1:
+                        autocorr = np.corrcoef(residuals[:-1], residuals[1:])[0,1]
+                        self.theta[s] = max(0.1, -np.log(max(0.01, autocorr)))
+
+            # Update transition matrix
+            for i in range(self.n_states):
+                for j in range(self.n_states):
+                    transitions = np.sum((states[:-1] == i) & (states[1:] == j))
+                    total_from_i = np.sum(states[:-1] == i)
+                    if total_from_i > 0:
+                        self.transition_matrix[i, j] = transitions / total_from_i
+
+            # Normalize transition matrix rows
+            row_sums = self.transition_matrix.sum(axis=1)
+            self.transition_matrix = self.transition_matrix / row_sums[:, np.newaxis]
+
+            # Compute log-likelihood
+            log_likelihood = self.compute_log_likelihood(data)
+
+            # Check convergence
+            if abs(log_likelihood - log_likelihood_prev) < tol:
+                print(f"Converged after {iteration + 1} iterations")
+                break
+
+            log_likelihood_prev = log_likelihood
+
+        return self
+
+    def compute_log_likelihood(self, data):
+        """Compute log-likelihood of data given current parameters"""
+        states = self.viterbi_states(data)
+        ll = 0
+
+        for t, (x, s) in enumerate(zip(data, states)):
+            ll += norm.logpdf(x, self.mu[s], self.sigma[s])
+
+        return ll
+
+    def compute_fit_score(self, original_data, simulated_data):
+        """Compute comprehensive fit score"""
+
+        # Time series similarity (correlation)
+        ts_corr = np.corrcoef(original_data, simulated_data)[0, 1]
+        if np.isnan(ts_corr):
+            ts_corr = 0
+
+        # Distribution similarity (Kolmogorov-Smirnov)
+        from scipy.stats import ks_2samp
+        ks_stat, _ = ks_2samp(original_data, simulated_data)
+
+        # Burst detection similarity
+        orig_bursts = np.sum(original_data > np.percentile(original_data, 90))
+        sim_bursts = np.sum(simulated_data > np.percentile(simulated_data, 90))
+        burst_similarity = 1 - abs(orig_bursts - sim_bursts) / max(orig_bursts, sim_bursts)
+
+        # Autocorrelation similarity
+        def autocorr(x, max_lag=20):
+            return [np.corrcoef(x[:-i], x[i:])[0,1] if i > 0 else 1.0
+                   for i in range(min(max_lag, len(x)//4))]
+
+        orig_ac = autocorr(original_data)
+        sim_ac = autocorr(simulated_data)
+        ac_similarity = np.corrcoef(orig_ac, sim_ac)[0, 1]
+        if np.isnan(ac_similarity):
+            ac_similarity = 0
+
+        # Combined score (lower is better)
+        score = (2 - ts_corr) + ks_stat + (1 - burst_similarity) + (1 - ac_similarity)
+        return score
+
+def load_and_preprocess_audio(filepath, target_length=6000):
+    """Load and preprocess whale vocalization data"""
+
+    # Load audio file
+    y, sr = librosa.load(filepath, sr=None)
+
+    # Compute amplitude envelope
+    hop_length = len(y) // target_length
+    amplitude_envelope = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+
+    # Normalize
+    amplitude_envelope = amplitude_envelope / np.max(amplitude_envelope)
+
+    return amplitude_envelope
+
+def main_analysis(audio_file_path):
+    """Main analysis pipeline"""
+
+    # Load data
+    print("Loading and preprocessing whale vocalization data...")
+    data = load_and_preprocess_audio(audio_file_path)
+
+    print(f"Data shape: {data.shape}")
+    print(f"Amplitude range: {np.min(data):.3f} to {np.max(data):.3f}")
+    print(f"Burst events (>90th percentile): {np.sum(data > np.percentile(data, 90))}")
+
+    # Fit regime-switching SDE
+    print("\nFitting Regime-Switching SDE...")
+    model = RegimeSwitchingSDE(n_states=4)
+    model.fit(data)
+
+    # Display fitted parameters
+    print("\nFitted Parameters:")
+    print("State-dependent parameters:")
+    for i, name in enumerate(model.state_names):
+        print(f"  {name}: μ={model.mu[i]:.3f}, θ={model.theta[i]:.3f}, σ={model.sigma[i]:.3f}")
+
+    print("\nTransition Matrix:")
+    for i, from_state in enumerate(model.state_names):
+        for j, to_state in enumerate(model.state_names):
+            if model.transition_matrix[i, j] > 0.01:
+                print(f"  {from_state} -> {to_state}: {model.transition_matrix[i, j]:.3f}")
+
+    # Simulate and compare
+    print("\nSimulating regime-switching model...")
+    sim_data, sim_states = model.simulate(T=len(data)*0.01, dt=0.01)
+
+    # Compute fit score
+    fit_score = model.compute_fit_score(data, sim_data)
+    print(f"\nRegime-Switching SDE Fit Score: {fit_score:.3f}")
+
+    # Create comprehensive plots
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+
+    # Time series comparison
+    axes[0, 0].plot(data, 'r-', alpha=0.7, label='Original', linewidth=1)
+    axes[0, 0].plot(sim_data, 'b-', alpha=0.7, label='Simulated', linewidth=1)
+    axes[0, 0].set_title(f'Regime-Switching SDE\nFit Score: {fit_score:.3f}')
+    axes[0, 0].set_xlabel('Time')
+    axes[0, 0].set_ylabel('Amplitude')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+
+    # State sequence
+    axes[0, 1].plot(sim_states, 'g-', linewidth=2)
+    axes[0, 1].set_title('Estimated State Sequence')
+    axes[0, 1].set_xlabel('Time')
+    axes[0, 1].set_ylabel('State')
+    axes[0, 1].set_yticks(range(4))
+    axes[0, 1].set_yticklabels(model.state_names)
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # Distribution comparison
+    axes[0, 2].hist(data, bins=50, alpha=0.7, density=True, label='Original', color='red')
+    axes[0, 2].hist(sim_data, bins=50, alpha=0.7, density=True, label='Simulated', color='blue')
+    axes[0, 2].set_title('Distribution Comparison')
+    axes[0, 2].set_xlabel('Amplitude')
+    axes[0, 2].set_ylabel('Density')
+    axes[0, 2].legend()
+    axes[0, 2].grid(True, alpha=0.3)
+
+    # State-dependent amplitude distributions
+    axes[1, 0].boxplot([sim_data[sim_states == s] for s in range(4) if np.sum(sim_states == s) > 0])
+    axes[1, 0].set_title('Amplitude by State')
+    axes[1, 0].set_xlabel('State')
+    axes[1, 0].set_ylabel('Amplitude')
+    axes[1, 0].set_xticklabels([model.state_names[s] for s in range(4) if np.sum(sim_states == s) > 0])
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # Transition matrix heatmap
+    im = axes[1, 1].imshow(model.transition_matrix, cmap='Blues', aspect='auto')
+    axes[1, 1].set_title('Transition Probability Matrix')
+    axes[1, 1].set_xticks(range(4))
+    axes[1, 1].set_yticks(range(4))
+    axes[1, 1].set_xticklabels(model.state_names, rotation=45)
+    axes[1, 1].set_yticklabels(model.state_names)
+
+    # Add text annotations
+    for i in range(4):
+        for j in range(4):
+            text = axes[1, 1].text(j, i, f'{model.transition_matrix[i, j]:.2f}',
+                                 ha="center", va="center", color="black")
+
+    plt.colorbar(im, ax=axes[1, 1])
+
+    # Burst analysis
+    original_bursts = data > np.percentile(data, 90)
+    simulated_bursts = sim_data > np.percentile(sim_data, 90)
+
+    axes[1, 2].plot(np.cumsum(original_bursts), 'r-', label='Original Burst Events')
+    axes[1, 2].plot(np.cumsum(simulated_bursts), 'b--', label='Simulated Burst Events')
+    axes[1, 2].set_title('Cumulative Burst Events')
+    axes[1, 2].set_xlabel('Time')
+    axes[1, 2].set_ylabel('Cumulative Bursts')
+    axes[1, 2].legend()
+    axes[1, 2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    return model, fit_score, sim_data, sim_states
+
+# Advanced regime-switching with improved estimation
+class AdvancedRegimeSwitchingSDE(RegimeSwitchingSDE):
+    """Enhanced version with better parameter estimation"""
+
+    def __init__(self, n_states=4):
+        super().__init__(n_states)
+        self.jump_prob = None  # Jump probabilities
+        self.jump_size = None  # Jump size parameters
+
+    def initialize_parameters(self, data):
+        """Enhanced initialization using change point detection"""
+        super().initialize_parameters(data)
+
+        # Detect change points for better state identification
+        change_points = self.detect_change_points(data)
+
+        # Refine parameters based on change points
+        segments = self.segment_data(data, change_points)
+
+        if len(segments) >= self.n_states:
+            # Update parameters based on segments
+            segment_stats = [(np.mean(seg), np.std(seg)) for seg in segments]
+            segment_stats.sort(key=lambda x: x[0])  # Sort by mean
+
+            for i in range(min(self.n_states, len(segment_stats))):
+                self.mu[i] = segment_stats[i][0]
+                self.sigma[i] = max(0.01, segment_stats[i][1])
+
+        # Add jump components for sudden transitions
+        self.jump_prob = np.array([0.01, 0.05, 0.02, 0.03])  # State-dependent jump prob
+        self.jump_size = np.array([0.1, 0.2, 0.3, -0.2])    # Expected jump sizes
+
+    def detect_change_points(self, data, window=50):
+        """Simple change point detection based on variance changes"""
+        change_points = []
+
+        for i in range(window, len(data) - window):
+            var_before = np.var(data[i-window:i])
+            var_after = np.var(data[i:i+window])
+
+            if abs(var_after - var_before) > 2 * np.std([var_before, var_after]):
+                change_points.append(i)
+
+        return change_points
+
+    def segment_data(self, data, change_points):
+        """Segment data based on change points"""
+        if not change_points:
+            return [data]
+
+        segments = []
+        start = 0
+
+        for cp in change_points:
+            if cp - start > 10:  # Minimum segment length
+                segments.append(data[start:cp])
+            start = cp
+
+        # Add final segment
+        if start < len(data) - 10:
+            segments.append(data[start:])
+
+        return segments
+
+    def simulate_with_jumps(self, T, dt=0.01):
+        """Simulate with jump components"""
+        n_steps = int(T / dt)
+        X = np.zeros(n_steps)
+        states = np.zeros(n_steps, dtype=int)
+        jumps = np.zeros(n_steps)
+
+        # Initial conditions
+        states[0] = np.random.choice(self.n_states, p=self.pi0)
+        X[0] = np.random.normal(self.mu[states[0]], self.sigma[states[0]]/np.sqrt(2*self.theta[states[0]]))
+
+        for i in range(1, n_steps):
+            # State transition
+            if np.random.random() < dt:
+                states[i] = np.random.choice(self.n_states, p=self.transition_matrix[states[i-1]])
+            else:
+                states[i] = states[i-1]
+
+            s = states[i]
+
+            # Regular SDE evolution
+            drift = self.theta[s] * (self.mu[s] - X[i-1]) * dt
+            diffusion = self.sigma[s] * np.sqrt(dt) * np.random.normal()
+
+            # Jump component
+            if np.random.random() < self.jump_prob[s] * dt:
+                jump = np.random.normal(self.jump_size[s], 0.1)
+                jumps[i] = jump
+            else:
+                jump = 0
+
+            X[i] = max(0, X[i-1] + drift + diffusion + jump)
+
+        return X, states, jumps
+
+# Example usage and testing
+def run_regime_switching_analysis():
+    """Run the complete regime-switching analysis"""
+
+    # Generate synthetic whale-like data for testing
+    # (Replace this with your actual audio loading)
+    np.random.seed(42)
+    t = np.linspace(0, 60, 6000)
+
+    # Create synthetic whale vocalization pattern
+    baseline = 0.05 + 0.02 * np.random.randn(len(t))
+
+    # Add burst events
+    burst_times = [1000, 1500, 3000, 3200, 4500, 5000]
+    for bt in burst_times:
+        if bt < len(baseline):
+            # Create sustained burst with exponential decay
+            burst_length = np.random.randint(100, 300)
+            end_idx = min(bt + burst_length, len(baseline))
+            decay = np.exp(-np.arange(end_idx - bt) / 50)
+            baseline[bt:end_idx] += 0.4 * decay
+
+    # Add noise
+    synthetic_data = np.maximum(0, baseline + 0.01 * np.random.randn(len(baseline)))
+
+    print("Running Regime-Switching SDE Analysis")
+    print("="*50)
+
+    # Fit basic regime-switching model
+    # basic_model, basic_score, basic_sim, basic_states = main_analysis(synthetic_data)
+
+    # print("\n" + "="*50)
+    # print("Running Advanced Regime-Switching SDE...")
+
+    # # Fit advanced model
+    # advanced_model = AdvancedRegimeSwitchingSDE(n_states=4)
+    # advanced_model.fit(synthetic_data)
+
+    # # Simulate advanced model
+    # adv_sim, adv_states, adv_jumps = advanced_model.simulate_with_jumps(T=len(synthetic_data)*0.01)
+    # adv_score = advanced_model.compute_fit_score(synthetic_data, adv_sim)
+
+    # print(f"Advanced Regime-Switching SDE Fit Score: {adv_score:.3f}")
+
+    # # Compare models
+    # print(f"\nModel Comparison:")
+    # print(f"Basic Regime-Switching: {basic_score:.3f}")
+    # print(f"Advanced Regime-Switching: {adv_score:.3f}")
+
+    # return basic_model, advanced_model, synthetic_data
+    # Example with synthetic data
+    # basic_model, advanced_model, data = run_regime_switching_analysis()
+
+    # To use with your actual whale audio file:
+    model, fit_score, sim_data, sim_states = main_analysis('/content/orca more sound.wav')
+
+# Run the analysis
+if __name__ == "__main__":
+    # Example with synthetic data
+    # basic_model, advanced_model, data = run_regime_switching_analysis()
+
+    # To use with your actual whale audio file:
+    model, fit_score, sim_data, sim_states = main_analysis('/content/orca more sound.wav')
