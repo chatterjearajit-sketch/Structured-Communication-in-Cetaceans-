@@ -1,0 +1,48 @@
+import librosa
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+
+# 1. Load your 1-minute WAV file
+wav_path = '/content/audiomass-output (3).wav'  # Change this to your actual file path
+y, sr = librosa.load(wav_path, sr=None)
+print(f"Audio loaded: {len(y)/sr:.2f} seconds at {sr} Hz sample rate")
+
+# 2. Extract MFCC features (e.g., 20 coefficients)
+mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+print(f"MFCC shape (coefficients x frames): {mfcc.shape}")
+
+# Transpose to have shape (timesteps, features) for LSTM input
+X = mfcc.T  # shape --> (timesteps, features)
+print(f"MFCC transposed shape for LSTM: {X.shape}")
+
+# 3. Prepare input data for LSTM (batch_size, timesteps, features)
+X = np.expand_dims(X, axis=0)  # Add batch dimension: shape = (1, timesteps, features)
+
+# 4. Define number of output classes or regression targets
+# For demo, let's assume 4 classes (replace as per your task)
+num_classes = 4
+
+# 5. Build a simple LSTM model
+model = Sequential()
+model.add(LSTM(64, input_shape=(X.shape[1], X.shape[2]), return_sequences=False))
+model.add(Dense(32, activation='relu'))
+model.add(Dense(num_classes, activation='softmax'))  # use 'softmax' for classification
+
+model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+model.summary()
+
+# 6. (Optional) Prepare dummy labels if you want to test training
+# For example, pretend this sample belongs to class 2
+dummy_labels = np.zeros((1, num_classes))
+dummy_labels[0, 2] = 1
+
+# 7. Train or predict
+# Training (uncomment if you have labels):
+# model.fit(X, dummy_labels, epochs=5)
+
+# Or prediction:
+preds = model.predict(X)
+print("Predicted class probabilities:", preds)
+print("Predicted class:", np.argmax(preds))
